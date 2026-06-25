@@ -6,6 +6,8 @@ Logs into a Gmail account, navigates to Google One, detects the
 """
 
 import logging
+import os
+import shutil
 import time
 import re
 from urllib.parse import urlparse
@@ -25,10 +27,44 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    from webdriver_manager.core.os_manager import ChromeType
+    HAS_WDM = True
+except ImportError:
+    HAS_WDM = False
+
 import config
 from device_simulator import DeviceProfile
 
 logger = logging.getLogger(__name__)
+
+
+# ── Chrome binary detection ───────────────────────────────────────────────────
+
+def _find_chrome_binary() -> Optional[str]:
+    """Auto-detect Chrome / Chromium binary path on the system."""
+    candidates = [
+        # Replit / nix
+        os.environ.get("CHROME_BIN"),
+        os.environ.get("CHROMIUM_BIN"),
+        os.environ.get("GOOGLE_CHROME_BIN"),
+        # Common Linux paths
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        "/nix/store/chromium/bin/chromium",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            logger.info("Found Chrome binary at: %s", path)
+            return path
+    return None
 
 
 # ── Driver factory ────────────────────────────────────────────────────────────
@@ -49,6 +85,17 @@ def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
     options.add_argument("--window-size=390,844")  # Pixel 10 Pro screen size
     options.add_argument(f"--user-agent={profile.user_agent}")
 
+    # Extra stability flags for headless Linux environments (Replit, etc.)
+    options.add_argument("--disable-setuid-sandbox")
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--single-process")
+
+    # Auto-detect Chrome / Chromium binary
+    chrome_bin = _find_chrome_binary()
+    if chrome_bin:
+        options.binary_location = chrome_bin
+
     # Mobile emulation – Pixel 10 Pro viewport
     mobile_emulation = {
         "deviceMetrics": {"width": 390, "height": 844, "pixelRatio": 3.0},
@@ -61,11 +108,35 @@ def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
     options.add_experimental_option("useAutomationExtension", False)
     options.add_argument("--disable-blink-features=AutomationControlled")
 
-    service = Service()  # relies on chromedriver being on PATH (Replit provides it)
+    # Build the service – prefer webdriver-manager for version matching
+    service = _create_service()
+
     driver = webdriver.Chrome(service=service, options=options)
     driver.implicitly_wait(config.IMPLICIT_WAIT)
     driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)
     return driver
+
+
+def _create_service() -> Service:
+    """Create a ChromeDriver Service, using webdriver-manager when available."""
+    if HAS_WDM:
+        try:
+            # Try Chromium first (common on Replit / nix)
+            path = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
+            logger.info("webdriver-manager installed chromedriver (Chromium) at: %s", path)
+            return Service(path)
+        except Exception:
+            pass
+        try:
+            # Fall back to standard Chrome
+            path = ChromeDriverManager().install()
+            logger.info("webdriver-manager installed chromedriver (Chrome) at: %s", path)
+            return Service(path)
+        except Exception as exc:
+            logger.warning("webdriver-manager failed (%s), falling back to PATH", exc)
+
+    # Final fallback – let Selenium find chromedriver on PATH
+    return Service()
 
 
 # ── Login helper ──────────────────────────────────────────────────────────────
