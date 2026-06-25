@@ -6,3 +6,6 @@ selenium==4.21.0
 
 # WebDriver management (auto-downloads matching chromedriver)
 webdriver-manager==4.0.1
+
+# TOTP 2FA code generation
+pyotp==2.9.0

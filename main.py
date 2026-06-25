@@ -3,7 +3,7 @@ Telegram Bot entry point for the Pixel 10 Pro Google One Gemini Bot.
 
 Commands:
   /start        – Show welcome message and available commands
-  /login        – Begin credential capture flow (email → password)
+  /login        – Begin credential capture flow (email → password → 2FA secret)
   /check_offer  – Run Google One automation and look for Gemini Pro offer
   /get_link     – Show the last captured offer link
   /status       – Show current session status and device profile
@@ -32,7 +32,7 @@ logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 # ── Conversation states ───────────────────────────────────────────────────────
-AWAIT_EMAIL, AWAIT_PASSWORD = range(2)
+AWAIT_EMAIL, AWAIT_PASSWORD, AWAIT_2FA_SECRET = range(3)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "logs into your Google account, and retrieves the *12-month free "
         "Gemini Pro* offer link from Google One.\n\n"
         "📋 *Available Commands:*\n"
-        "• /login – Enter your Gmail credentials\n"
+        "• /login – Enter your Gmail credentials & 2FA secret\n"
         "• /check\\_offer – Detect the Gemini Pro offer\n"
         "• /get\\_link – Show the last captured offer link\n"
         "• /status – View current session & device info\n\n"
@@ -90,16 +90,9 @@ async def login_email(update: Update,
 
 async def login_password(update: Update,
                          context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Store credentials, generate a new device profile, and finish."""
-    chat_id = update.effective_chat.id
+    """Store the password and ask for the 2FA secret."""
     password = update.message.text.strip()
-    email = context.user_data.pop("pending_email", "")
-
-    session = _get_session(chat_id)
-    session["email"] = email
-    session["password"] = password
-    session["device"] = create_device_profile()
-    session["offer_link"] = None
+    context.user_data["pending_password"] = password
 
     # Delete the message containing the password for security
     try:
@@ -108,10 +101,64 @@ async def login_password(update: Update,
         pass
 
     await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
+            "✅ Password received.\n\n"
+            "🔑 Now enter your *2FA Secret Key* (32-character base32 string).\n"
+            "Example: `VPN4ONAHFANZKXZPFK2XJYLRPMEXYUCB`\n\n"
+            "This is the secret key from your authenticator app setup "
+            "(not the 6-digit code)."
+        ),
+        parse_mode="Markdown",
+    )
+    return AWAIT_2FA_SECRET
+
+
+async def login_2fa_secret(update: Update,
+                           context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Validate the TOTP secret, store all credentials, and finish."""
+    import pyotp
+
+    chat_id = update.effective_chat.id
+    raw_secret = update.message.text.strip().upper().replace(" ", "")
+
+    # Delete the message containing the secret for security
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    # Validate the secret is a valid base32 TOTP key
+    try:
+        totp = pyotp.TOTP(raw_secret)
+        # Generate a test code to confirm the secret is valid
+        totp.now()
+    except Exception:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "❌ Invalid 2FA secret. Please provide a valid base32 string "
+                "(typically 32 characters, A-Z and 2-7).\n\n"
+                "🔑 Try again – enter your 2FA secret key:"
+            ),
+        )
+        return AWAIT_2FA_SECRET
+
+    email = context.user_data.pop("pending_email", "")
+    password = context.user_data.pop("pending_password", "")
+
+    session = _get_session(chat_id)
+    session["email"] = email
+    session["password"] = password
+    session["totp_secret"] = raw_secret
+    session["device"] = create_device_profile()
+    session["offer_link"] = None
+
+    await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            "✅ *Credentials saved* and a new Pixel 10 Pro device profile has "
-            "been created for this session.\n\n"
+            "✅ *Credentials & 2FA secret saved.* A new Pixel 10 Pro device "
+            "profile has been created for this session.\n\n"
             + session["device"].summary()
             + "\n\nUse /check\\_offer to search for the Gemini Pro offer."
         ),
@@ -124,6 +171,7 @@ async def login_cancel(update: Update,
                        context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the login conversation."""
     context.user_data.pop("pending_email", None)
+    context.user_data.pop("pending_password", None)
     await update.message.reply_text(
         "❌ Login cancelled.",
         reply_markup=ReplyKeyboardRemove(),
@@ -139,7 +187,7 @@ async def check_offer(update: Update,
     chat_id = update.effective_chat.id
     session = _get_session(chat_id)
 
-    if not session.get("email") or not session.get("password"):
+    if not session.get("email") or not session.get("password") or not session.get("totp_secret"):
         await update.message.reply_text(
             "⚠️ No credentials found. Please use /login first."
         )
@@ -159,6 +207,7 @@ async def check_offer(update: Update,
         offer_link = check_gemini_offer(
             session["email"],
             session["password"],
+            session["totp_secret"],
             device,
         )
     except GoogleAutomationError as exc:
@@ -227,6 +276,7 @@ async def status(update: Update,
 
     email = session.get("email", "—")
     has_creds = bool(session.get("email") and session.get("password"))
+    has_2fa = bool(session.get("totp_secret"))
     offer_link = session.get("offer_link")
     device = session.get("device")
 
@@ -234,6 +284,7 @@ async def status(update: Update,
         "📊 *Session Status*\n",
         f"Account: `{email}`",
         f"Credentials loaded: {'✅' if has_creds else '❌'}",
+        f"2FA secret loaded: {'✅' if has_2fa else '❌'}",
         f"Offer link captured: {'✅' if offer_link else '❌'}",
     ]
 
@@ -268,6 +319,9 @@ def main() -> None:
             ],
             AWAIT_PASSWORD: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)
+            ],
+            AWAIT_2FA_SECRET: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_2fa_secret)
             ],
         },
         fallbacks=[CommandHandler("cancel", login_cancel)],
